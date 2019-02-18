@@ -1,21 +1,39 @@
 package gremgo
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/pkg/errors"
+)
+
+const connRequestQueueSize = 1000000
+
+// errors
+var (
+	ErrGraphDBClosed = errors.New("graphdb is closed")
+	ErrBadConn       = errors.New("bad conn")
 )
 
 // Pool maintains a list of connections.
 type Pool struct {
-	Dial        func() (*Client, error)
-	MaxOpen     int
-	MaxLifetime time.Duration
-	mu          sync.Mutex
-	idle        []*idleConnection
-	open        int
-	cond        *sync.Cond
-	cleanerCh   chan struct{}
-	closed      bool
+	Dial         func() (*Client, error)
+	MaxOpen      int
+	MaxLifetime  time.Duration
+	mu           sync.Mutex
+	freeConns    []*PooledConnection
+	open         int
+	openerCh     chan struct{}
+	connRequests map[uint64]chan connRequest
+	nextRequest  uint64
+	cleanerCh    chan struct{}
+	closed       bool
+}
+
+type connRequest struct {
+	pc  *PooledConnection
+	err error
 }
 
 // PooledConnection represents a shared and reusable connection.
@@ -25,86 +43,200 @@ type PooledConnection struct {
 	t      time.Time
 }
 
-type idleConnection struct {
-	pc *PooledConnection
+func (p *Pool) maybeOpenNewConnections() {
+	if p.closed {
+		return
+	}
+	numRequests := len(p.connRequests)
+	if p.MaxOpen > 0 {
+		numCanOpen := p.MaxOpen - p.open
+		if numRequests > numCanOpen {
+			numRequests = numCanOpen
+		}
+	}
+	for numRequests > 0 {
+		p.open++
+		numRequests--
+		p.openerCh <- struct{}{}
+	}
+}
+
+func (p *Pool) opener() {
+	for range p.openerCh {
+		p.openNewConnection()
+	}
+}
+
+func (p *Pool) openNewConnection() {
+	if p.closed {
+		p.mu.Lock()
+		p.open--
+		p.mu.Unlock()
+		return
+	}
+	c, err := p.Dial()
+	if err != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.open--
+		p.maybeOpenNewConnections()
+		return
+	}
+	pc := &PooledConnection{
+		Pool:   p,
+		Client: c,
+		t:      time.Now(),
+	}
+	p.mu.Lock()
+	if !p.putConnLocked(pc, nil) {
+		p.open--
+		p.mu.Unlock()
+		pc.Client.Close()
+		return
+	}
+	p.mu.Unlock()
+	return
+}
+
+// PutConn is return connetion to the connection pool.
+func (p *Pool) PutConn(pc *PooledConnection, err error) error {
+	p.mu.Lock()
+	if !p.putConnLocked(pc, err) {
+		p.open--
+		p.mu.Unlock()
+		pc.Client.Close()
+		return err
+	}
+	p.mu.Unlock()
+	return err
+}
+
+func (p *Pool) putConnLocked(pc *PooledConnection, err error) bool {
+	if p.closed {
+		return false
+	}
+	if p.MaxOpen > 0 && p.MaxOpen < p.open {
+		return false
+	}
+	if len(p.connRequests) > 0 {
+		var req chan connRequest
+		var reqKey uint64
+		for reqKey, req = range p.connRequests {
+			break
+		}
+		delete(p.connRequests, reqKey)
+		req <- connRequest{
+			pc:  pc,
+			err: err,
+		}
+	} else {
+		p.freeConns = append(p.freeConns, pc)
+		p.startCleanerLocked()
+	}
+	return true
 }
 
 // Get will return an available pooled connection. Either an idle connection or
 // by dialing a new one if the pool does not currently have a maximum number
 // of active connections.
 func (p *Pool) Get() (*PooledConnection, error) {
-	// Lock the pool to keep the kids out.
-	p.mu.Lock()
-
-	// Wait loop
-	for {
-		conn := p.first()
-		if conn != nil {
-			// Remove the connection from the idle slice
-			numIdle := len(p.idle)
-			copy(p.idle, p.idle[1:])
-			p.idle = p.idle[:numIdle-1]
-			if p.MaxLifetime <= 0 || time.Now().Before(conn.pc.t.Add(p.MaxLifetime)) {
-				p.mu.Unlock()
-				pc := &PooledConnection{Pool: p, Client: conn.pc.Client, t: conn.pc.t}
-				return pc, nil
-			}
-
-			p.open--
-			conn.pc.Client.Close()
-		}
-
-		// No idle connections, try dialing a new one
-		if p.MaxOpen == 0 || p.open < p.MaxOpen {
-			p.open++
-			dial := p.Dial
-
-			// Unlock here so that any other connections that need to be
-			// dialed do not have to wait.
-			p.mu.Unlock()
-
-			dc, err := dial()
-			if err != nil {
-				p.mu.Lock()
-				p.open--
-				p.release()
-				p.mu.Unlock()
-				return nil, err
-			}
-
-			pc := &PooledConnection{Pool: p, Client: dc, t: time.Now()}
-			return pc, nil
-		}
-
-		//No idle connections and max active connections, let's wait.
-		if p.cond == nil {
-			p.cond = sync.NewCond(&p.mu)
-		}
-
-		p.cond.Wait()
+	ctx := context.Background()
+	cn, err := p.conn(ctx, true)
+	if err == nil {
+		return cn, nil
 	}
+	if errors.Cause(err) == ErrBadConn {
+		return p.conn(ctx, false)
+	}
+	return cn, err
 }
 
-// put pushes the supplied PooledConnection to the top of the idle slice to be reused.
-// It is not threadsafe. The caller should manage locking the pool.
-func (p *Pool) put(pc *PooledConnection) {
+func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, error) {
+	p.mu.Lock()
 	if p.closed {
-		pc.Client.Close()
-		return
+		p.mu.Unlock()
+		return nil, ErrGraphDBClosed
 	}
-	if pc.Client != nil && pc.Client.Errored {
+	// Check if the context is expired.
+	select {
+	default:
+	case <-ctx.Done():
+		p.mu.Unlock()
+		return nil, errors.Wrap(ctx.Err(), "the context is expired")
+	}
+	lifetime := p.MaxLifetime
+
+	var pc *PooledConnection
+	numFree := len(p.freeConns)
+	if useFreeConn && numFree > 0 {
+		pc = p.freeConns[0]
+		copy(p.freeConns, p.freeConns[1:])
+		p.freeConns = p.freeConns[:numFree-1]
+		p.mu.Unlock()
+		if pc.expired(lifetime) {
+			p.mu.Lock()
+			p.open--
+			p.mu.Unlock()
+			pc.Client.Close()
+			return nil, ErrBadConn
+		}
+		return pc, nil
+	}
+
+	if p.MaxOpen > 0 && p.MaxOpen <= p.open {
+		req := make(chan connRequest, 1)
+		reqKey := p.nextRequest
+		p.nextRequest++
+		p.connRequests[reqKey] = req
+		p.mu.Unlock()
+
+		select {
+		// timeout
+		case <-ctx.Done():
+			// Remove the connection request and ensure no value has been sent
+			// on it after removing.
+			p.mu.Lock()
+			delete(p.connRequests, reqKey)
+			p.mu.Unlock()
+			select {
+			case ret, ok := <-req:
+				if ok {
+					p.PutConn(ret.pc, ret.err)
+				}
+			default:
+			}
+			return nil, errors.Wrap(ctx.Err(), "Deadline of connRequests exceeded")
+		case ret, ok := <-req:
+			if !ok {
+				return nil, ErrGraphDBClosed
+			}
+			if ret.err != nil {
+				return ret.pc, errors.Wrap(ret.err, "Response has an error")
+			}
+			return ret.pc, nil
+		}
+	}
+
+	p.open++
+	p.mu.Unlock()
+	newCn, err := p.Dial()
+	if err != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
 		p.open--
-		pc.Client.Close()
-		return
+		p.maybeOpenNewConnections()
+		return nil, errors.Wrap(err, "Failed newConn")
 	}
-	idle := &idleConnection{pc: pc}
-	p.idle = append(p.idle, idle)
-	p.startCleanerLocked()
+	return &PooledConnection{
+		Pool:   p,
+		Client: newCn,
+		t:      time.Now(),
+	}, nil
 }
 
 func (p *Pool) needStartCleaner() bool {
 	return p.MaxLifetime > 0 &&
-		len(p.idle) > 0 &&
+		p.open > 0 &&
 		p.cleanerCh == nil
 }
 
@@ -133,56 +265,37 @@ func (p *Pool) connectionCleaner() {
 
 		ml := p.MaxLifetime
 		p.mu.Lock()
-		if p.closed || len(p.idle) == 0 || ml <= 0 {
+		if p.closed || len(p.freeConns) == 0 || ml <= 0 {
 			p.cleanerCh = nil
 			p.mu.Unlock()
 			return
 		}
 		n := time.Now()
 		mlExpiredSince := n.Add(-ml)
-		var closing []*idleConnection
-		for i := 0; i < len(p.idle); i++ {
-			c := p.idle[i]
-			if (ml > 0 && c.pc.t.Before(mlExpiredSince)) ||
-				c.pc.Client.Errored {
+		var closing []*PooledConnection
+		for i := 0; i < len(p.freeConns); i++ {
+			pc := p.freeConns[i]
+			if (ml > 0 && pc.t.Before(mlExpiredSince)) ||
+				pc.Client.Errored {
 				p.open--
-				closing = append(closing, c)
-				last := len(p.idle) - 1
-				p.idle[i] = p.idle[last]
-				p.idle[last] = nil
-				p.idle = p.idle[:last]
+				closing = append(closing, pc)
+				last := len(p.freeConns) - 1
+				p.freeConns[i] = p.freeConns[last]
+				p.freeConns[last] = nil
+				p.freeConns = p.freeConns[:last]
 				i--
 			}
 		}
 		p.mu.Unlock()
 
-		for _, c := range closing {
-			if c.pc.Client != nil {
-				c.pc.Client.Close()
+		for _, pc := range closing {
+			if pc.Client != nil {
+				pc.Client.Close()
 			}
 		}
 
 		t.Reset(d)
 	}
-}
-
-// release decrements active and alerts waiters.
-// It is not threadsafe. The caller should manage locking the pool.
-func (p *Pool) release() {
-	if p.closed {
-		return
-	}
-	if p.cond != nil {
-		p.cond.Signal()
-	}
-
-}
-
-func (p *Pool) first() *idleConnection {
-	if len(p.idle) == 0 {
-		return nil
-	}
-	return p.idle[0]
 }
 
 // Close closes the pool.
@@ -193,18 +306,15 @@ func (p *Pool) Close() {
 	if p.cleanerCh != nil {
 		close(p.cleanerCh)
 	}
-	for _, c := range p.idle {
-		c.pc.Client.Close()
+	for _, pc := range p.freeConns {
+		pc.Client.Close()
 	}
 	p.closed = true
 }
 
-// Close signals that the caller is finished with the connection and should be
-// returned to the pool for future use.
-func (pc *PooledConnection) Close() {
-	pc.Pool.mu.Lock()
-	defer pc.Pool.mu.Unlock()
-
-	pc.Pool.put(pc)
-	pc.Pool.release()
+func (pc *PooledConnection) expired(timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	return pc.t.Add(timeout).Before(time.Now())
 }

@@ -380,9 +380,9 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 }
 
-func (pc *conn) expired(timeout time.Duration) bool {
+func (cn *conn) expired(timeout time.Duration) bool {
 	if timeout <= 0 {
 		return false
 	}
-	return pc.t.Add(timeout).Before(time.Now())
+	return cn.t.Add(timeout).Before(time.Now())
 }

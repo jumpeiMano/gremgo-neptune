@@ -24,7 +24,7 @@ type Pool struct {
 	MaxLifetime  time.Duration
 	dial         func() (*Client, error)
 	mu           sync.Mutex
-	freeConns    []*PooledConnection
+	freeConns    []*conn
 	open         int
 	openerCh     chan struct{}
 	connRequests map[uint64]chan connRequest
@@ -46,12 +46,12 @@ func NewPool(dial func() (*Client, error)) *Pool {
 }
 
 type connRequest struct {
-	pc  *PooledConnection
+	*conn
 	err error
 }
 
-// PooledConnection represents a shared and reusable connection.
-type PooledConnection struct {
+// conn represents a shared and reusable connection.
+type conn struct {
 	Pool   *Pool
 	Client *Client
 	t      time.Time
@@ -96,16 +96,16 @@ func (p *Pool) openNewConnection() {
 		p.maybeOpenNewConnections()
 		return
 	}
-	pc := &PooledConnection{
+	cn := &conn{
 		Pool:   p,
 		Client: c,
 		t:      time.Now(),
 	}
 	p.mu.Lock()
-	if !p.putConnLocked(pc, nil) {
+	if !p.putConnLocked(cn, nil) {
 		p.open--
 		p.mu.Unlock()
-		pc.Client.Close()
+		cn.Client.Close()
 		return
 	}
 	p.mu.Unlock()
@@ -113,19 +113,19 @@ func (p *Pool) openNewConnection() {
 }
 
 // putConn is return connetion to the connection pool.
-func (p *Pool) putConn(pc *PooledConnection, err error) error {
+func (p *Pool) putConn(cn *conn, err error) error {
 	p.mu.Lock()
-	if !p.putConnLocked(pc, err) {
+	if !p.putConnLocked(cn, err) {
 		p.open--
 		p.mu.Unlock()
-		pc.Client.Close()
+		cn.Client.Close()
 		return err
 	}
 	p.mu.Unlock()
 	return err
 }
 
-func (p *Pool) putConnLocked(pc *PooledConnection, err error) bool {
+func (p *Pool) putConnLocked(cn *conn, err error) bool {
 	if p.closed {
 		return false
 	}
@@ -140,32 +140,32 @@ func (p *Pool) putConnLocked(pc *PooledConnection, err error) bool {
 		}
 		delete(p.connRequests, reqKey)
 		req <- connRequest{
-			pc:  pc,
-			err: err,
+			conn: cn,
+			err:  err,
 		}
 	} else {
-		p.freeConns = append(p.freeConns, pc)
+		p.freeConns = append(p.freeConns, cn)
 		p.startCleanerLocked()
 	}
 	return true
 }
 
-// get will return an available pooled connection. Either an idle connection or
+// conn will return an available pooled connection. Either an idle connection or
 // by dialing a new one if the pool does not currently have a maximum number
 // of active connections.
-func (p *Pool) get() (*PooledConnection, error) {
+func (p *Pool) conn() (*conn, error) {
 	ctx := context.Background()
-	cn, err := p.conn(ctx, true)
+	cn, err := p._conn(ctx, true)
 	if err == nil {
 		return cn, nil
 	}
 	if errors.Cause(err) == ErrBadConn {
-		return p.conn(ctx, false)
+		return p._conn(ctx, false)
 	}
 	return cn, err
 }
 
-func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, error) {
+func (p *Pool) _conn(ctx context.Context, useFreeConn bool) (*conn, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -180,7 +180,7 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 	}
 	lifetime := p.MaxLifetime
 
-	var pc *PooledConnection
+	var pc *conn
 	numFree := len(p.freeConns)
 	if useFreeConn && numFree > 0 {
 		pc = p.freeConns[0]
@@ -215,7 +215,7 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 			select {
 			case ret, ok := <-req:
 				if ok {
-					p.putConn(ret.pc, ret.err)
+					p.putConn(ret.conn, ret.err)
 				}
 			default:
 			}
@@ -225,9 +225,9 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 				return nil, ErrGraphDBClosed
 			}
 			if ret.err != nil {
-				return ret.pc, errors.Wrap(ret.err, "Response has an error")
+				return ret.conn, errors.Wrap(ret.err, "Response has an error")
 			}
-			return ret.pc, nil
+			return ret.conn, nil
 		}
 	}
 
@@ -241,7 +241,7 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 		p.maybeOpenNewConnections()
 		return nil, errors.Wrap(err, "Failed newConn")
 	}
-	return &PooledConnection{
+	return &conn{
 		Pool:   p,
 		Client: newCn,
 		t:      time.Now(),
@@ -286,7 +286,7 @@ func (p *Pool) connectionCleaner() {
 		}
 		n := time.Now()
 		mlExpiredSince := n.Add(-ml)
-		var closing []*PooledConnection
+		var closing []*conn
 		for i := 0; i < len(p.freeConns); i++ {
 			pc := p.freeConns[i]
 			if (ml > 0 && pc.t.Before(mlExpiredSince)) ||
@@ -314,7 +314,7 @@ func (p *Pool) connectionCleaner() {
 
 // ExecuteWithBindings formats a raw Gremlin query, sends it to Gremlin Server, and returns the result.
 func (p *Pool) ExecuteWithBindings(query string, bindings, rebindings map[string]string) (resp []Response, err error) {
-	pc, err := p.get()
+	pc, err := p.conn()
 	if err != nil {
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
@@ -327,7 +327,7 @@ func (p *Pool) ExecuteWithBindings(query string, bindings, rebindings map[string
 
 // Execute formats a raw Gremlin query, sends it to Gremlin Server, and returns the result.
 func (p *Pool) Execute(query string) (resp []Response, err error) {
-	pc, err := p.get()
+	pc, err := p.conn()
 	if err != nil {
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
@@ -340,7 +340,7 @@ func (p *Pool) Execute(query string) (resp []Response, err error) {
 
 // ExecuteFile takes a file path to a Gremlin script, sends it to Gremlin Server, and returns the result.
 func (p *Pool) ExecuteFile(path string, bindings, rebindings map[string]string) (resp []Response, err error) {
-	pc, err := p.get()
+	pc, err := p.conn()
 	if err != nil {
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
@@ -380,7 +380,7 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 }
 
-func (pc *PooledConnection) expired(timeout time.Duration) bool {
+func (pc *conn) expired(timeout time.Duration) bool {
 	if timeout <= 0 {
 		return false
 	}

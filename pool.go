@@ -2,6 +2,8 @@ package gremgo
 
 import (
 	"context"
+	"io/ioutil"
+	"log"
 	"sync"
 	"time"
 
@@ -148,10 +150,10 @@ func (p *Pool) putConnLocked(pc *PooledConnection, err error) bool {
 	return true
 }
 
-// Get will return an available pooled connection. Either an idle connection or
+// get will return an available pooled connection. Either an idle connection or
 // by dialing a new one if the pool does not currently have a maximum number
 // of active connections.
-func (p *Pool) Get() (*PooledConnection, error) {
+func (p *Pool) get() (*PooledConnection, error) {
 	ctx := context.Background()
 	cn, err := p.conn(ctx, true)
 	if err == nil {
@@ -308,6 +310,51 @@ func (p *Pool) connectionCleaner() {
 
 		t.Reset(d)
 	}
+}
+
+// ExecuteWithBindings formats a raw Gremlin query, sends it to Gremlin Server, and returns the result.
+func (p *Pool) ExecuteWithBindings(query string, bindings, rebindings map[string]string) (resp []Response, err error) {
+	pc, err := p.get()
+	if err != nil {
+		return resp, errors.Wrap(err, "Failed p.Get")
+	}
+	defer func() {
+		p.PutConn(pc, err)
+	}()
+	resp, err = pc.Client.executeRequest(query, &bindings, &rebindings)
+	return
+}
+
+// Execute formats a raw Gremlin query, sends it to Gremlin Server, and returns the result.
+func (p *Pool) Execute(query string) (resp []Response, err error) {
+	pc, err := p.get()
+	if err != nil {
+		return resp, errors.Wrap(err, "Failed p.Get")
+	}
+	defer func() {
+		p.PutConn(pc, err)
+	}()
+	resp, err = pc.Client.executeRequest(query, nil, nil)
+	return
+}
+
+// ExecuteFile takes a file path to a Gremlin script, sends it to Gremlin Server, and returns the result.
+func (p *Pool) ExecuteFile(path string, bindings, rebindings map[string]string) (resp []Response, err error) {
+	pc, err := p.get()
+	if err != nil {
+		return resp, errors.Wrap(err, "Failed p.Get")
+	}
+	defer func() {
+		p.PutConn(pc, err)
+	}()
+	d, err := ioutil.ReadFile(path) // Read script from file
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	query := string(d)
+	resp, err = pc.Client.executeRequest(query, &bindings, &rebindings)
+	return
 }
 
 // Close closes the pool.

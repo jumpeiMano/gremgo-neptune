@@ -160,7 +160,7 @@ func TestGetAndDial(t *testing.T) {
 	pool.mu.Unlock()
 	time.Sleep(1010 * time.Millisecond)
 
-	conn, err := pool.Get()
+	conn, err := pool.get()
 
 	if err != nil {
 		t.Error(err)
@@ -186,7 +186,7 @@ func TestGetAndDial(t *testing.T) {
 	}
 
 	// Get a new connection and ensure that it is the now idling connection
-	conn, err = pool.Get()
+	conn, err = pool.get()
 
 	if err != nil {
 		t.Error(err)

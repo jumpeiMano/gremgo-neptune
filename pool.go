@@ -18,9 +18,9 @@ var (
 
 // Pool maintains a list of connections.
 type Pool struct {
-	Dial         func() (*Client, error)
 	MaxOpen      int
 	MaxLifetime  time.Duration
+	dial         func() (*Client, error)
 	mu           sync.Mutex
 	freeConns    []*PooledConnection
 	open         int
@@ -29,6 +29,18 @@ type Pool struct {
 	nextRequest  uint64
 	cleanerCh    chan struct{}
 	closed       bool
+}
+
+// NewPool create ConnectionPool
+func NewPool(dial func() (*Client, error)) *Pool {
+	p := new(Pool)
+	p.dial = dial
+	p.openerCh = make(chan struct{}, connRequestQueueSize)
+	p.connRequests = make(map[uint64]chan connRequest)
+
+	go p.opener()
+
+	return p
 }
 
 type connRequest struct {
@@ -74,7 +86,7 @@ func (p *Pool) openNewConnection() {
 		p.mu.Unlock()
 		return
 	}
-	c, err := p.Dial()
+	c, err := p.dial()
 	if err != nil {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -219,7 +231,7 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 
 	p.open++
 	p.mu.Unlock()
-	newCn, err := p.Dial()
+	newCn, err := p.dial()
 	if err != nil {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -301,15 +313,24 @@ func (p *Pool) connectionCleaner() {
 // Close closes the pool.
 func (p *Pool) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
+	close(p.openerCh)
 	if p.cleanerCh != nil {
 		close(p.cleanerCh)
 	}
-	for _, pc := range p.freeConns {
-		pc.Client.Close()
+	for _, cr := range p.connRequests {
+		close(cr)
 	}
 	p.closed = true
+	p.mu.Unlock()
+	for _, pc := range p.freeConns {
+		if pc.Client != nil {
+			pc.Client.Close()
+		}
+	}
+	p.mu.Lock()
+	p.freeConns = nil
+	p.mu.Unlock()
 }
 
 func (pc *PooledConnection) expired(timeout time.Duration) bool {

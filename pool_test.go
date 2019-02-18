@@ -12,16 +12,16 @@ func TestConnectionCleaner(t *testing.T) {
 	n := time.Now()
 
 	// invalid has timedout and should be cleaned up
-	invalid := &PooledConnection{Client: &Client{}, t: n.Add(-1030 * time.Millisecond)}
+	invalid := &conn{Client: &Client{}, t: n.Add(-1030 * time.Millisecond)}
 	// valid has not yet timed out and should remain in the freeConns pool
-	valid := &PooledConnection{Client: &Client{}, t: n.Add(1030 * time.Millisecond)}
+	valid := &conn{Client: &Client{}, t: n.Add(1030 * time.Millisecond)}
 
 	// Pool has a 30 second timeout and an freeConns connection slice containing both
 	// the invalid and valid freeConns connections
 	p := NewPool(dummyDialFunc)
 	defer p.Close()
 	p.MaxLifetime = time.Second * 1
-	p.freeConns = []*PooledConnection{invalid, valid}
+	p.freeConns = []*conn{invalid, valid}
 
 	if len(p.freeConns) != 2 {
 		t.Errorf("Expected 2 freeConns connections, got %d", len(p.freeConns))
@@ -53,13 +53,13 @@ func TestPurgeErrorClosedConnection(t *testing.T) {
 	defer p.Close()
 	p.MaxLifetime = time.Second * 1
 
-	valid := &PooledConnection{Client: &Client{}, t: n.Add(1030 * time.Millisecond)}
+	valid := &conn{Client: &Client{}, t: n.Add(1030 * time.Millisecond)}
 
 	client := &Client{}
 
-	closed := &PooledConnection{Pool: p, Client: client, t: n.Add(1030 * time.Millisecond)}
+	closed := &conn{Pool: p, Client: client, t: n.Add(1030 * time.Millisecond)}
 
-	freeConns := []*PooledConnection{valid, closed}
+	freeConns := []*conn{valid, closed}
 
 	p.freeConns = freeConns
 
@@ -88,7 +88,7 @@ func TestPurgeErrorClosedConnection(t *testing.T) {
 func TestPooledConnectionClose(t *testing.T) {
 	pool := NewPool(dummyDialFunc)
 	defer pool.Close()
-	pc := &PooledConnection{Pool: pool}
+	pc := &conn{Pool: pool}
 
 	if len(pool.freeConns) != 0 {
 		t.Errorf("Expected 0 freeConns connection, got %d", len(pool.freeConns))
@@ -113,10 +113,10 @@ func TestFirst(t *testing.T) {
 	defer pool.Close()
 	pool.MaxOpen = 1
 	pool.MaxLifetime = 30 * time.Millisecond
-	freeConnsd := []*PooledConnection{
-		&PooledConnection{Pool: pool, Client: &Client{}, t: n.Add(-45 * time.Millisecond)}, // expired
-		&PooledConnection{Pool: pool, Client: &Client{}, t: n.Add(-45 * time.Millisecond)}, // expired
-		&PooledConnection{Pool: pool, Client: &Client{}},                                   // valid
+	freeConnsd := []*conn{
+		&conn{Pool: pool, Client: &Client{}, t: n.Add(-45 * time.Millisecond)}, // expired
+		&conn{Pool: pool, Client: &Client{}, t: n.Add(-45 * time.Millisecond)}, // expired
+		&conn{Pool: pool, Client: &Client{}},                                   // valid
 	}
 	pool.freeConns = freeConnsd
 
@@ -142,9 +142,9 @@ func TestGetAndDial(t *testing.T) {
 	defer pool.Close()
 	pool.MaxLifetime = time.Millisecond * 30
 
-	invalid := &PooledConnection{Pool: pool, Client: &Client{}, t: n.Add(-30 * time.Millisecond)}
+	invalid := &conn{Pool: pool, Client: &Client{}, t: n.Add(-30 * time.Millisecond)}
 
-	freeConns := []*PooledConnection{invalid}
+	freeConns := []*conn{invalid}
 	pool.freeConns = freeConns
 
 	if len(pool.freeConns) != 1 {
@@ -160,7 +160,7 @@ func TestGetAndDial(t *testing.T) {
 	pool.mu.Unlock()
 	time.Sleep(1010 * time.Millisecond)
 
-	conn, err := pool.get()
+	conn, err := pool.conn()
 
 	if err != nil {
 		t.Error(err)
@@ -186,7 +186,7 @@ func TestGetAndDial(t *testing.T) {
 	}
 
 	// Get a new connection and ensure that it is the now idling connection
-	conn, err = pool.get()
+	conn, err = pool.conn()
 
 	if err != nil {
 		t.Error(err)

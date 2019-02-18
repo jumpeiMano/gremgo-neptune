@@ -94,7 +94,7 @@ func TestPooledConnectionClose(t *testing.T) {
 		t.Errorf("Expected 0 freeConns connection, got %d", len(pool.freeConns))
 	}
 
-	pool.PutConn(pc, nil)
+	pool.putConn(pc, nil)
 
 	if len(pool.freeConns) != 1 {
 		t.Errorf("Expected 1 freeConns connection, got %d", len(pool.freeConns))
@@ -179,7 +179,7 @@ func TestGetAndDial(t *testing.T) {
 	}
 
 	// Close the connection and ensure it was returned to the freeConns pool
-	pool.PutConn(conn, nil)
+	pool.putConn(conn, nil)
 
 	if len(pool.freeConns) != 1 {
 		t.Error("Expected connection to be returned to freeConns pool")

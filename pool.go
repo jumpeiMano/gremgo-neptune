@@ -112,8 +112,8 @@ func (p *Pool) openNewConnection() {
 	return
 }
 
-// PutConn is return connetion to the connection pool.
-func (p *Pool) PutConn(pc *PooledConnection, err error) error {
+// putConn is return connetion to the connection pool.
+func (p *Pool) putConn(pc *PooledConnection, err error) error {
 	p.mu.Lock()
 	if !p.putConnLocked(pc, err) {
 		p.open--
@@ -215,7 +215,7 @@ func (p *Pool) conn(ctx context.Context, useFreeConn bool) (*PooledConnection, e
 			select {
 			case ret, ok := <-req:
 				if ok {
-					p.PutConn(ret.pc, ret.err)
+					p.putConn(ret.pc, ret.err)
 				}
 			default:
 			}
@@ -319,7 +319,7 @@ func (p *Pool) ExecuteWithBindings(query string, bindings, rebindings map[string
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
 	defer func() {
-		p.PutConn(pc, err)
+		p.putConn(pc, err)
 	}()
 	resp, err = pc.Client.executeRequest(query, &bindings, &rebindings)
 	return
@@ -332,7 +332,7 @@ func (p *Pool) Execute(query string) (resp []Response, err error) {
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
 	defer func() {
-		p.PutConn(pc, err)
+		p.putConn(pc, err)
 	}()
 	resp, err = pc.Client.executeRequest(query, nil, nil)
 	return
@@ -345,7 +345,7 @@ func (p *Pool) ExecuteFile(path string, bindings, rebindings map[string]string) 
 		return resp, errors.Wrap(err, "Failed p.Get")
 	}
 	defer func() {
-		p.PutConn(pc, err)
+		p.putConn(pc, err)
 	}()
 	d, err := ioutil.ReadFile(path) // Read script from file
 	if err != nil {
